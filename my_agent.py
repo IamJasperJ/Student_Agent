@@ -24,7 +24,8 @@ tools = [
 
 TOOLS_HANDLE = {
     "bash": lambda kw: Tools.run_bash(kw['command'], WORKDIR),
-    "read_file": lambda kw: Tools.run_read(kw['path'], kw.get('limit'), WORKDIR)
+    "read_file": lambda kw: Tools.run_read(kw['path'], kw.get('limit'), WORKDIR),
+    "write_file": lambda kw: Tools.run_write(kw['path'], kw.get('limit'), WORKDIR),
 }
 def agent_loop(messages: str):
     while True:
