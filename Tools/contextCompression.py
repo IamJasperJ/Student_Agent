@@ -6,7 +6,17 @@ API_KEY = os.getenv('API_KEY')
 MODEL = os.getenv('MODEL_ID')
 API_URL = os.getenv('MODEL_BASE_URL')
 
-def contextCompression(messages, threshold: int, summary_focus):
+def _message_to_text(message):
+    if isinstance(message, dict):
+        content = message.get("content") or ""
+        tool_calls = message.get("tool_calls")
+        if tool_calls:
+            content = f"{content}\nTool calls: {tool_calls}".strip()
+        return f"{message.get('role', 'unknown')}: {content}"
+    return str(message)
+
+
+def contextCompression(messages, threshold: int = None, summary_focus=None):
     """
     当消息列表超过 threshold 时，对旧消息进行压缩。
     """
@@ -32,12 +42,7 @@ def contextCompression(messages, threshold: int, summary_focus):
 )   
 
     # 使用 LLM 生成摘要 (这里可以调用一个更便宜的模型压缩，省钱且快)
-    content_to_summarize = ""
-    for m in to_compress:
-        if isinstance(m, dict):
-            content_to_summarize.join(f"\n{m['role']}: {m.get('content', '')}")
-        else:
-            content_to_summarize.join(str(m))
+    content_to_summarize = "\n".join(_message_to_text(m) for m in to_compress)
 
     focus = "Focus on key facts and progress to maintain context for future interactions."
     if summary_focus:
@@ -76,6 +81,10 @@ CONTEXTCOMPRESSION_DESCRIPTION = {
                 "summary_focus": {
                     "type": "string",
                     "description": "Optional: Specify specific topics or critical data that must be preserved in the summary (e.g., 'keep the file paths' or 'summarize only the student's personal info')."
+                },
+                "threshold": {
+                    "type": "integer",
+                    "description": "Optional: Compress only when the message count exceeds this threshold."
                 }
             },
             "required": []

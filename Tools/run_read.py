@@ -1,7 +1,7 @@
 from Tools.safe_path import safe_path
 def run_read(path: str, limit: int = None, WORKDIR = None) -> str:
     try:
-        text = safe_path(path, WORKDIR).read_text()
+        text = safe_path(path, WORKDIR).read_text(encoding="utf-8", errors="replace")
         lines = text.splitlines()
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]

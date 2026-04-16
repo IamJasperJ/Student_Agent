@@ -1,7 +1,7 @@
 # 核心网络与请求
 requests==2.32.5
 httpx==0.28.1
-urllib3==2.6.3
+urllib3==1.26.20
 # AI 模型与数据解析
 openai==2.30.0
 pydantic==2.12.5

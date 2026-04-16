@@ -5,6 +5,12 @@ import json
 from pathlib import Path
 from html import unescape
 from urllib.parse import unquote, urlparse, parse_qs
+
+REQUEST_TIMEOUT = (5, 30)
+POLL_TIMEOUT = 20
+POLL_MAX_WAIT_SECONDS = 180
+
+
 class USTBAuth:
     def __init__(self):
         self.session = requests.Session()
@@ -29,13 +35,20 @@ class USTBAuth:
         }
         
         try:
-            response = self.session.get(entry_url, params=params, allow_redirects=False)
+            response = self.session.get(
+                entry_url,
+                params=params,
+                allow_redirects=False,
+                timeout=REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
             pattern = r'lck=([^&]+)'
-            match = re.search(pattern, response.headers['Location'])
+            match = re.search(pattern, response.headers.get('Location', ''))
+            if not match:
+                raise RuntimeError("认证入口未返回 lck")
             return match.group(1)
-        except Exception:
-            assert 1, f"error in {str(Path(__file__))}"
-        return None
+        except Exception as e:
+            raise RuntimeError(f"获取 lck 失败: {Path(__file__)}") from e
 
 
 
@@ -51,7 +64,13 @@ class USTBAuth:
         }
         
         headers = {'Content-Type': 'application/json'}
-        response = self.session.post(url, data=json.dumps(payload), headers=headers)
+        response = self.session.post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
         data = response.json()
         
         if data.get('code') == '200':
@@ -73,7 +92,8 @@ class USTBAuth:
             "embed_flag": "1"
         }
         
-        response = self.session.get(url, params=params)
+        response = self.session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
         
         # 文档明确说明：使用正则提取 sid
         match = re.search(r'sid\s?=\s?(\w{32})', response.text)
@@ -90,10 +110,9 @@ class USTBAuth:
         url = "https://sis.ustb.edu.cn/connect/qrimg"
         params = {'sid': sid}
         
-        response = self.session.get(url, params=params)
+        response = self.session.get(url, params=params, timeout=REQUEST_TIMEOUT)
         if response.status_code == 200:
-            from pathlib import Path
-            path = Path.cwd() / 'network_block/Auth/ustb_qrcode.png'
+            path = Path(__file__).resolve().parent / 'ustb_qrcode.png'
             with open(path, 'wb') as f:
                 f.write(response.content)
             # print("✅ 二维码已保存为 'ustb_qrcode.png'，请使用微信扫描")
@@ -109,8 +128,10 @@ class USTBAuth:
         
         print("⏳ 正在轮询扫码状态，请在手机上确认...")
         
-        while True:
-            response = self.session.get(url, params=params, timeout=200) # 文档提到请求可能挂起约15秒
+        deadline = time.monotonic() + POLL_MAX_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            response = self.session.get(url, params=params, timeout=POLL_TIMEOUT) # 文档提到请求可能挂起约15秒
+            response.raise_for_status()
             data = response.json()
             
             code = data.get('code')
@@ -129,9 +150,12 @@ class USTBAuth:
             else:
                 print(f"状态异常: {data.get('message')}")
                 time.sleep(5)
+        raise TimeoutError("扫码确认超时")
 
     def final_authentication(self, auth_code, qr_data):
         base_return_url = qr_data.get('returnUrl')
+        if not base_return_url:
+            raise ValueError("认证返回数据缺少 returnUrl")
         
         # 移除 base_return_url 结尾可能存在的问号
         base_return_url = base_return_url.split('?')[0]
@@ -158,8 +182,10 @@ class USTBAuth:
             base_return_url, 
             params=params, 
             headers=headers,
-            allow_redirects=True
+            allow_redirects=True,
+            timeout=REQUEST_TIMEOUT,
         )
+        response.raise_for_status()
     
         text = response.text
 
@@ -181,7 +207,12 @@ class USTBAuth:
         
             # 5. 执行最后一次跳转，获取业务 Cookie
             # 这步完成后，session.cookies 应该会出现 'JSESSIONID' 或应用特有的 Cookie
-            final_resp = self.session.get(location_value, allow_redirects=True)
+            final_resp = self.session.get(
+                location_value,
+                allow_redirects=True,
+                timeout=REQUEST_TIMEOUT,
+            )
+            final_resp.raise_for_status()
             
             # 打印调试信息：看看最后停在哪个 URL 了
             print(f"🏁 最终停留在: {final_resp.url}")

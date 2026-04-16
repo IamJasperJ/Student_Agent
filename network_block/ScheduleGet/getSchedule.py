@@ -3,6 +3,13 @@ from ..Auth import read_cookie
 from pathlib import Path
 import re
 import json
+import os
+from datetime import date
+from dotenv import load_dotenv
+
+load_dotenv(override=True)
+
+REQUEST_TIMEOUT = (5, 30)
 
 # 目标 URL
 url = "https://byyt.ustb.edu.cn/xszykb/queryxszykbzong"
@@ -28,38 +35,62 @@ headers = {
 }
 
 
-# # 设置表单数据 (Payload)
-data = {
-    # 学年
-    'xn': '2025-2026',
-    # 学期
-    'xq': '2',
-}
+def _current_academic_year_term(today=None):
+    today = today or date.today()
+    if today.month >= 9:
+        return f"{today.year}-{today.year + 1}", "1"
+    if today.month <= 1:
+        return f"{today.year - 1}-{today.year}", "1"
+    return f"{today.year - 1}-{today.year}", "2"
+
+
+def _schedule_payload():
+    default_year, default_term = _current_academic_year_term()
+    return {
+        'xn': os.getenv('SCHEDULE_YEAR', default_year),
+        'xq': os.getenv('SCHEDULE_TERM', default_term),
+    }
+
+
 def getSchedule(update_force: bool = False):
     # 检查缓存
     if (update_force == False):
         path = Path(__file__).parent / "Schedule" / "user_1_Sche.json"
         if path.is_file():
-            parse_sche = {}
-            with open(path, 'r') as f:
-                parse_sche = json.loads(f.read())
-            return parse_sche
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except (OSError, json.JSONDecodeError):
+                pass
         
     try:
         cookies = read_cookie()
         # 发送 POST 请求
-        response = requests.post(url, headers=headers, cookies=cookies, data=data)
+        response = requests.post(
+            url,
+            headers=headers,
+            cookies=cookies,
+            data=_schedule_payload(),
+            timeout=REQUEST_TIMEOUT,
+        )
         response.raise_for_status()
         info = response.json()
+        if not isinstance(info, list):
+            return {"ok": False, "error": "课表接口返回格式不是列表", "raw": info}
+
         parse_sche = []
         for dic in info:
-            parse_sche.append(parse_course_info(dic["SKSJ"]))
+            raw_course = dic.get("SKSJ") if isinstance(dic, dict) else None
+            if raw_course:
+                parse_sche.append(parse_course_info(raw_course))
         writeSchedule(parse_sche)
         return parse_sche
     except requests.exceptions.HTTPError as err:
-        print(f"HTTP 错误: {err}")
+        return {"ok": False, "error": f"HTTP 错误: {err}"}
+    except requests.exceptions.RequestException as err:
+        return {"ok": False, "error": f"网络请求错误: {err}"}
     except Exception as e:
-        print(f"发生错误: {e}")
+        return {"ok": False, "error": f"发生错误: {e}"}
 
 
 
@@ -124,7 +155,8 @@ def parse_course_info(raw_text):
 
 def writeSchedule(parse_sche):
     path = Path(__file__).parent / "Schedule" / "user_1_Sche.json"
-    with open(path, 'w') as f:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
         f.write(json.dumps(parse_sche, ensure_ascii=False, indent=4))
 
 

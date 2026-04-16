@@ -2,7 +2,7 @@ from network_block.ScheduleGet.getSchedule import getSchedule
 import json
 def get_class_sche(update_force: bool = False):
     sche = getSchedule(update_force)
-    return json.dumps(sche)
+    return json.dumps(sche, ensure_ascii=False)
 
 GETSCHE_DESCRIPTION = {
     "type": "function",
@@ -20,7 +20,7 @@ GETSCHE_DESCRIPTION = {
                         "when the user explicitly says."
                 },
             },
-            "required": ["update_force"]
+            "required": []
         }
     }
 }

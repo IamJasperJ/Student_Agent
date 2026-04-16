@@ -24,18 +24,21 @@ headers = {
     # 'sec-ch-ua-platform': '"macOS"',
 }
 
+COOKIE_PATH = Path(__file__).resolve().parent / 'cookie.json'
+
+
 def write_cookie(cookie, path):
-    with open(path, 'w') as f:
-        f.write(json.dumps(cookie))
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(json.dumps(cookie, ensure_ascii=False, indent=2))
 
 def read_cookie():
-    path = Path(__file__).resolve().parent / 'cookie.json'
+    path = COOKIE_PATH
     data = {}
     
     # 1. 尝试读取缓存
     if path.exists():
         try:
-            with open(path, 'r') as f:
+            with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
         except json.JSONDecodeError:
             print("Cookie 文件格式损坏")
