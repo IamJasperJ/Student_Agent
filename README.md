@@ -32,8 +32,19 @@ cp .env.example .env
 - 通过兼容 OpenAI 的 Chat Completions API 运行命令行 agent
 - 支持读取工作区文件、执行受限检查命令、压缩上下文
 - 支持通过 USTB 认证流程获取并缓存课表
+- 支持启动 background 子 agent 执行独立任务，并通过任务 id 查询结果
 
 首次获取课表时会生成 `network_block/Auth/ustb_qrcode.png`，需要用微信扫码确认。认证后的 Cookie 会缓存到 `network_block/Auth/cookie.json`。这两个文件都已加入 `.gitignore`。
+
+## Background 子 Agent
+
+主 agent 可以调用三个后台任务工具：
+
+- `start_background_task`：启动后台子 agent，并立刻返回 `task_id`
+- `get_background_task`：根据 `task_id` 查询状态、结果或错误
+- `list_background_tasks`：列出当前进程内的后台任务
+
+后台任务在独立线程里运行，使用独立上下文，不会阻塞主输入循环。当前任务状态只保存在当前进程内，重启程序后会清空。
 
 ## 安全说明
 
@@ -57,3 +68,5 @@ cp .env.example .env
 - [ ] 定时提醒，如上课前30分钟，前一天晚
   - [ ] 调用发送信息工具，工具具体实现暂时不写
     - [ ] 工具发送消息与小程序对接，实际编写
+- [ ] 添加background、agent team功能
+  - [x] 添加background子agent执行任务功能
