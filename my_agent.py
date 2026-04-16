@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from dotenv import load_dotenv
 import sys
+import re
+import subprocess
 import threading
 import time
 import traceback
@@ -28,6 +30,15 @@ client = OpenAI(
 )
 
 WORKDIR = Path.cwd()
+EXECUTION_CONTEXT = threading.local()
+
+
+def current_workdir():
+    return getattr(EXECUTION_CONTEXT, "workdir", WORKDIR)
+
+
+def current_tool_scope():
+    return getattr(EXECUTION_CONTEXT, "tool_scope", "main")
 
 BASE_TOOLS = [
     Tools.RUNBASH_DESCRIPTION,
@@ -104,6 +115,10 @@ CREATE_TEAM_AGENT_DESCRIPTION = {
                 "system_prompt": {
                     "type": "string",
                     "description": "Optional extra instruction for this sub-agent."
+                },
+                "worktree_id": {
+                    "type": "string",
+                    "description": "Optional managed worktree id where this sub-agent should work."
                 }
             },
             "required": ["name", "role"]
@@ -139,6 +154,10 @@ ASSIGN_TEAM_TASK_DESCRIPTION = {
                 "task": {
                     "type": "string",
                     "description": "The concrete task for the sub-agent."
+                },
+                "worktree_id": {
+                    "type": "string",
+                    "description": "Optional managed worktree id overriding the sub-agent default for this task."
                 }
             },
             "required": ["agent_id", "task"]
@@ -240,6 +259,89 @@ STOP_TEAM_AGENT_DESCRIPTION = {
     }
 }
 
+CREATE_WORKTREE_DESCRIPTION = {
+    "type": "function",
+    "function": {
+        "name": "create_worktree",
+        "description": "Create an isolated git worktree under .agent_worktrees for coding tasks.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Short safe name for the worktree directory."
+                },
+                "branch": {
+                    "type": "string",
+                    "description": "Optional branch name. Defaults to agent/<name>-<id>."
+                },
+                "base_ref": {
+                    "type": "string",
+                    "description": "Optional base ref to create from. Defaults to HEAD."
+                },
+                "create_branch": {
+                    "type": "boolean",
+                    "description": "Whether to create a new branch for the worktree. Defaults to true."
+                }
+            },
+            "required": ["name"]
+        }
+    }
+}
+
+LIST_WORKTREES_DESCRIPTION = {
+    "type": "function",
+    "function": {
+        "name": "list_worktrees",
+        "description": "List git worktrees and mark which ones are managed by this agent.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    }
+}
+
+GET_WORKTREE_DESCRIPTION = {
+    "type": "function",
+    "function": {
+        "name": "get_worktree",
+        "description": "Get details for a managed worktree.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "worktree_id": {
+                    "type": "string",
+                    "description": "Managed worktree id, usually the directory name."
+                }
+            },
+            "required": ["worktree_id"]
+        }
+    }
+}
+
+REMOVE_WORKTREE_DESCRIPTION = {
+    "type": "function",
+    "function": {
+        "name": "remove_worktree",
+        "description": "Remove a managed worktree under .agent_worktrees.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "worktree_id": {
+                    "type": "string",
+                    "description": "Managed worktree id to remove."
+                },
+                "force": {
+                    "type": "boolean",
+                    "description": "Force removal even if git reports local changes. Defaults to false."
+                }
+            },
+            "required": ["worktree_id"]
+        }
+    }
+}
+
 BACKGROUND_TOOLS = [
     START_BACKGROUND_TASK_DESCRIPTION,
     GET_BACKGROUND_TASK_DESCRIPTION,
@@ -257,7 +359,19 @@ TEAM_TOOLS = [
     STOP_TEAM_AGENT_DESCRIPTION,
 ]
 
-tools = BASE_TOOLS + BACKGROUND_TOOLS + TEAM_TOOLS
+WORKTREE_TOOLS = [
+    CREATE_WORKTREE_DESCRIPTION,
+    LIST_WORKTREES_DESCRIPTION,
+    GET_WORKTREE_DESCRIPTION,
+    REMOVE_WORKTREE_DESCRIPTION,
+]
+
+MANAGEMENT_TOOLS = BACKGROUND_TOOLS + TEAM_TOOLS + WORKTREE_TOOLS
+SUB_AGENT_TOOLS = BASE_TOOLS
+MAIN_AGENT_TOOLS = BASE_TOOLS + MANAGEMENT_TOOLS
+
+# Backward-compatible alias for callers that import the old name.
+tools = MAIN_AGENT_TOOLS
 
 TOKEN_THRESHOLD = 80000
 def estimate_tokens(messages: list) -> int:
@@ -338,13 +452,180 @@ class BackgroundAgentManager:
 background_manager = BackgroundAgentManager()
 
 
+class WorktreeManager:
+    SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+    SAFE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./-]{0,127}$")
+
+    def __init__(self, repo_root):
+        self.repo_root = Path(repo_root).resolve()
+        self.worktrees_root = self.repo_root / ".agent_worktrees"
+
+    def _run_git(self, args, timeout=120):
+        result = subprocess.run(
+            ["git", *args],
+            cwd=self.repo_root,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        output = (result.stdout + result.stderr).strip()
+        if result.returncode != 0:
+            raise RuntimeError(output or f"git {' '.join(args)} failed")
+        return output
+
+    def _safe_name(self, name):
+        if not self.SAFE_NAME_RE.match(name or ""):
+            raise ValueError("name must use letters, numbers, dot, dash, or underscore, and start with a letter/number")
+        return name
+
+    def _safe_ref(self, ref, field_name):
+        if not self.SAFE_REF_RE.match(ref or ""):
+            raise ValueError(f"{field_name} has unsafe characters")
+        if ".." in ref or ref.startswith("/") or ref.endswith("/"):
+            raise ValueError(f"{field_name} is not a safe git ref")
+        return ref
+
+    def _managed_path(self, worktree_id):
+        name = self._safe_name(worktree_id)
+        path = (self.worktrees_root / name).resolve()
+        try:
+            path.relative_to(self.worktrees_root.resolve())
+        except ValueError:
+            raise ValueError(f"worktree escapes managed root: {worktree_id}")
+        return path
+
+    def _parse_porcelain(self, output):
+        worktrees = []
+        current = None
+        for line in output.splitlines():
+            if not line:
+                if current:
+                    worktrees.append(current)
+                    current = None
+                continue
+            key, _, value = line.partition(" ")
+            if key == "worktree":
+                if current:
+                    worktrees.append(current)
+                path = Path(value).resolve()
+                managed = self._is_managed_path(path)
+                current = {
+                    "path": str(path),
+                    "worktree_id": path.name if managed else None,
+                    "managed": managed,
+                    "head": "",
+                    "branch": "",
+                    "detached": False,
+                    "bare": False,
+                }
+            elif current is not None and key == "HEAD":
+                current["head"] = value
+            elif current is not None and key == "branch":
+                current["branch"] = value
+            elif current is not None and key == "detached":
+                current["detached"] = True
+            elif current is not None and key == "bare":
+                current["bare"] = True
+        if current:
+            worktrees.append(current)
+        return worktrees
+
+    def _is_managed_path(self, path):
+        try:
+            path.relative_to(self.worktrees_root.resolve())
+            return True
+        except ValueError:
+            return False
+
+    def create(self, name, branch=None, base_ref=None, create_branch=True):
+        try:
+            name = self._safe_name(name)
+            worktree_id = name
+            path = self._managed_path(worktree_id)
+            if path.exists():
+                return {"ok": False, "error": f"Worktree path already exists: {path}"}
+
+            base_ref = self._safe_ref(base_ref or "HEAD", "base_ref")
+            self.worktrees_root.mkdir(parents=True, exist_ok=True)
+
+            if create_branch:
+                checkout_ref = branch or f"agent/{name}-{uuid.uuid4().hex[:8]}"
+                checkout_ref = self._safe_ref(checkout_ref, "branch")
+                args = ["worktree", "add", "-b", checkout_ref, str(path), base_ref]
+            else:
+                checkout_ref = self._safe_ref(branch or base_ref, "checkout_ref")
+                args = ["worktree", "add", str(path), checkout_ref]
+            output = self._run_git(args)
+            return {
+                "ok": True,
+                "worktree_id": worktree_id,
+                "path": str(path),
+                "checkout_ref": checkout_ref,
+                "base_ref": base_ref,
+                "created_branch": bool(create_branch),
+                "git_output": output,
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def list(self):
+        try:
+            output = self._run_git(["worktree", "list", "--porcelain"])
+            return {"ok": True, "worktrees": self._parse_porcelain(output)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def get(self, worktree_id):
+        try:
+            target = self._managed_path(worktree_id)
+            listing = self.list()
+            if not listing.get("ok"):
+                return listing
+            for worktree in listing["worktrees"]:
+                if Path(worktree["path"]).resolve() == target:
+                    return {"ok": True, "worktree": worktree}
+            return {"ok": False, "error": f"Unknown managed worktree: {worktree_id}"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def remove(self, worktree_id, force=False):
+        try:
+            target = self._managed_path(worktree_id)
+            details = self.get(worktree_id)
+            if not details.get("ok"):
+                return details
+            args = ["worktree", "remove"]
+            if force:
+                args.append("--force")
+            args.append(str(target))
+            output = self._run_git(args)
+            prune_output = self._run_git(["worktree", "prune"])
+            return {
+                "ok": True,
+                "worktree_id": worktree_id,
+                "path": str(target),
+                "git_output": output,
+                "prune_output": prune_output,
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+
+worktree_manager = WorktreeManager(WORKDIR)
+
+
 class AgentTeamManager:
     def __init__(self):
         self._agents = {}
         self._tasks = {}
         self._lock = threading.Lock()
 
-    def create_agent(self, name, role, system_prompt=None):
+    def create_agent(self, name, role, system_prompt=None, worktree_id=None):
+        if worktree_id:
+            worktree = worktree_manager.get(worktree_id)
+            if not worktree.get("ok"):
+                return worktree
+
         agent_id = f"agent_{uuid.uuid4().hex[:8]}"
         now = time.strftime("%Y-%m-%d %H:%M:%S")
         record = {
@@ -352,6 +633,7 @@ class AgentTeamManager:
             "name": name,
             "role": role,
             "system_prompt": system_prompt or "",
+            "worktree_id": worktree_id or "",
             "status": "active",
             "created_at": now,
             "updated_at": now,
@@ -364,6 +646,7 @@ class AgentTeamManager:
             "agent_id": agent_id,
             "name": name,
             "role": role,
+            "worktree_id": worktree_id or "",
             "status": "active",
         }
 
@@ -376,6 +659,7 @@ class AgentTeamManager:
                         "agent_id": agent["agent_id"],
                         "name": agent["name"],
                         "role": agent["role"],
+                        "worktree_id": agent["worktree_id"],
                         "status": agent["status"],
                         "task_count": len(agent["tasks"]),
                         "created_at": agent["created_at"],
@@ -385,7 +669,12 @@ class AgentTeamManager:
                 ],
             }
 
-    def assign_task(self, agent_id, task, runner):
+    def assign_task(self, agent_id, task, runner, worktree_id=None):
+        if worktree_id:
+            worktree = worktree_manager.get(worktree_id)
+            if not worktree.get("ok"):
+                return worktree
+
         with self._lock:
             agent = self._agents.get(agent_id)
             if not agent:
@@ -402,6 +691,7 @@ class AgentTeamManager:
                 "task_id": task_id,
                 "agent_id": agent_id,
                 "agent_name": agent["name"],
+                "worktree_id": worktree_id or agent["worktree_id"],
                 "task": task,
                 "status": "queued",
                 "cancel_requested": False,
@@ -445,7 +735,7 @@ class AgentTeamManager:
             task_record = dict(self._tasks[task_id])
             agent_record = dict(self._agents[task_record["agent_id"]])
         try:
-            result = runner(agent_record, task_record["task"])
+            result = runner(agent_record, task_record["task"], task_record.get("worktree_id"))
             with self._lock:
                 cancelled = self._tasks[task_id]["cancel_requested"]
             self._update_task(
@@ -476,6 +766,7 @@ class AgentTeamManager:
                         "task_id": task["task_id"],
                         "agent_id": task["agent_id"],
                         "agent_name": task["agent_name"],
+                        "worktree_id": task["worktree_id"],
                         "task": task["task"],
                         "status": task["status"],
                         "review_status": task["review_status"],
@@ -579,81 +870,96 @@ def extract_latest_assistant_text(messages):
     return ""
 
 
-def agent_loop(messages, echo=True, allow_background=True, allow_team=True, max_steps=20):
+def get_tools_for_scope(tool_scope):
+    if tool_scope == "main":
+        return MAIN_AGENT_TOOLS
+    if tool_scope == "subagent":
+        return SUB_AGENT_TOOLS
+    raise ValueError(f"Unknown tool scope: {tool_scope}")
+
+
+def agent_loop(messages, echo=True, tool_scope="main", max_steps=20):
     steps = 0
-    active_tools = list(BASE_TOOLS)
-    if allow_background:
-        active_tools.extend(BACKGROUND_TOOLS)
-    if allow_team:
-        active_tools.extend(TEAM_TOOLS)
-    while steps < max_steps:
-        steps += 1
+    active_tools = get_tools_for_scope(tool_scope)
+    previous_scope = getattr(EXECUTION_CONTEXT, "tool_scope", None)
+    EXECUTION_CONTEXT.tool_scope = tool_scope
+    try:
+        while steps < max_steps:
+            steps += 1
 
-        # 如果对话历史过长，主动调用 contextCompression
-        if estimate_tokens(messages) > TOKEN_THRESHOLD:
-            if echo:
-                print("--- 检测到对话过长，正在自动压缩上下文... ---")
-            args = {
-                "messages": messages
-            }
-            messages[:] = TOOLS_HANDLE["contextCompression"](args)
+            # 如果对话历史过长，主动调用 contextCompression
+            if estimate_tokens(messages) > TOKEN_THRESHOLD:
+                if echo:
+                    print("--- 检测到对话过长，正在自动压缩上下文... ---")
+                args = {
+                    "messages": messages
+                }
+                messages[:] = TOOLS_HANDLE["contextCompression"](args)
 
-        # send query
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            tools=active_tools,
-            max_tokens=8000
-        )
-        for choice in response.choices:
+            # send query
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                tools=active_tools,
+                max_tokens=8000
+            )
+            for choice in response.choices:
 
-            # print content in console
-            if echo and choice.message.content:
-                print(choice.message.content)
-            messages.append(assistant_message_to_dict(choice.message))
+                # print content in console
+                if echo and choice.message.content:
+                    print(choice.message.content)
+                messages.append(assistant_message_to_dict(choice.message))
 
-            # deal with the tool call
-            if choice.finish_reason != "tool_calls":
-                continue
-            for tool_call in choice.message.tool_calls or []:
-                try:
-                    args = json.loads(tool_call.function.arguments or "{}")
-                except json.JSONDecodeError as e:
-                    output = f"Error: invalid tool arguments JSON: {e}"
+                # deal with the tool call
+                if choice.finish_reason != "tool_calls":
+                    continue
+                for tool_call in choice.message.tool_calls or []:
+                    try:
+                        args = json.loads(tool_call.function.arguments or "{}")
+                    except json.JSONDecodeError as e:
+                        output = f"Error: invalid tool arguments JSON: {e}"
+                        messages.append({
+                            "tool_call_id": tool_call.id,
+                            "role": "tool",
+                            "name": tool_call.function.name,
+                            "content": output
+                        })
+                        continue
+                    
+                    # print the tool call information
+                    if echo:
+                        print(f"\tNow agent will call the {tool_call.function.name} " +
+                              f"with arguments: {args}")
+                    output = None
+                    if tool_call.function.name not in TOOLS_HANDLE:
+                        output = f"Error: unknown tool '{tool_call.function.name}'"
+                        if echo:
+                            print(output)
+                    if tool_call.function.name != "contextCompression":
+                        if output is None:
+                            output = TOOLS_HANDLE[tool_call.function.name](args)
+                            if echo:
+                                print(serialize_tool_output(output))
+                    else:
+                        args["messages"] = messages
+                        messages[:] = TOOLS_HANDLE["contextCompression"](args)
+                        output = "Compression Done."
                     messages.append({
                         "tool_call_id": tool_call.id,
                         "role": "tool",
                         "name": tool_call.function.name,
-                        "content": output
+                        "content": serialize_tool_output(output)
                     })
-                    continue
-                
-                # print the tool call information
-                if echo:
-                    print(f"\tNow agent will call the {tool_call.function.name} " +
-                          f"with arguments: {args}")
-                output = None
-                if tool_call.function.name not in TOOLS_HANDLE:
-                    output = f"Error: unknown tool '{tool_call.function.name}'"
-                    if echo:
-                        print(output)
-                if tool_call.function.name != "contextCompression":
-                    if output is None:
-                        output = TOOLS_HANDLE[tool_call.function.name](args)
-                        if echo:
-                            print(serialize_tool_output(output))
-                else:
-                    args["messages"] = messages
-                    messages[:] = TOOLS_HANDLE["contextCompression"](args)
-                    output = "Compression Done."
-                messages.append({
-                    "tool_call_id": tool_call.id,
-                    "role": "tool",
-                    "name": tool_call.function.name,
-                    "content": serialize_tool_output(output)
-                })
-        if response.choices[0].finish_reason != "tool_calls":
-            return extract_latest_assistant_text(messages)
+            if response.choices[0].finish_reason != "tool_calls":
+                return extract_latest_assistant_text(messages)
+    finally:
+        if previous_scope is None:
+            try:
+                del EXECUTION_CONTEXT.tool_scope
+            except AttributeError:
+                pass
+        else:
+            EXECUTION_CONTEXT.tool_scope = previous_scope
     return "Error: agent loop reached max_steps before completion."
 
 
@@ -664,6 +970,7 @@ def run_background_task(task):
             "content": (
                 f"You are a background USTB sub-agent working at {WORKDIR}. "
                 "Complete the assigned task independently with the available tools. "
+                "You cannot create sub-agents or manage worktrees. "
                 "Return a concise final result for the main agent."
             )
         },
@@ -672,18 +979,26 @@ def run_background_task(task):
     result = agent_loop(
         messages,
         echo=False,
-        allow_background=False,
-        allow_team=False,
+        tool_scope="subagent",
         max_steps=20,
     )
     return result or extract_latest_assistant_text(messages) or "(no result)"
 
 
-def run_team_agent_task(agent, task):
+def run_team_agent_task(agent, task, worktree_id=None):
+    active_workdir = WORKDIR
+    selected_worktree = worktree_id or agent.get("worktree_id")
+    if selected_worktree:
+        worktree = worktree_manager.get(selected_worktree)
+        if not worktree.get("ok"):
+            return serialize_tool_output(worktree)
+        active_workdir = Path(worktree["worktree"]["path"])
+
     system_prompt = (
-        f"You are {agent['name']}, a USTB team sub-agent working at {WORKDIR}. "
+        f"You are {agent['name']}, a USTB team sub-agent working at {active_workdir}. "
         f"Your role is: {agent['role']}. "
-        "Complete only the assigned task, use tools when useful, and return a concise result for review."
+        "Complete only the assigned task, use tools when useful, and return a concise result for review. "
+        "You cannot create sub-agents or manage worktrees."
     )
     if agent.get("system_prompt"):
         system_prompt = f"{system_prompt}\nAdditional instruction: {agent['system_prompt']}"
@@ -692,45 +1007,80 @@ def run_team_agent_task(agent, task):
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": task}
     ]
-    result = agent_loop(
-        messages,
-        echo=False,
-        allow_background=False,
-        allow_team=False,
-        max_steps=20,
-    )
+    previous_workdir = getattr(EXECUTION_CONTEXT, "workdir", None)
+    EXECUTION_CONTEXT.workdir = active_workdir
+    try:
+        result = agent_loop(
+            messages,
+            echo=False,
+            tool_scope="subagent",
+            max_steps=20,
+        )
+    finally:
+        if previous_workdir is None:
+            try:
+                del EXECUTION_CONTEXT.workdir
+            except AttributeError:
+                pass
+        else:
+            EXECUTION_CONTEXT.workdir = previous_workdir
     return result or extract_latest_assistant_text(messages) or "(no result)"
 
 
+def main_scope_only(handler):
+    def wrapped(kw):
+        if current_tool_scope() != "main":
+            return {
+                "ok": False,
+                "error": "This management tool is only available to the main agent loop.",
+            }
+        return handler(kw)
+    return wrapped
+
+
 TOOLS_HANDLE = {
-    "bash": lambda kw: Tools.run_bash(kw['command'], WORKDIR),
-    "read_file": lambda kw: Tools.run_read(kw['path'], kw.get('limit'), WORKDIR),
+    "bash": lambda kw: Tools.run_bash(kw['command'], current_workdir()),
+    "read_file": lambda kw: Tools.run_read(kw['path'], kw.get('limit'), current_workdir()),
     # "write_file": lambda kw: Tools.run_write(kw['path'], kw.get('limit'), WORKDIR),
     "contextCompression": lambda kw: Tools.contextCompression(kw['messages'], kw.get('threshold'), kw.get('summary_focus')),
     "get_class_sche": lambda kw: Tools.get_class_sche(kw.get("update_force", False)),
-    "start_background_task": lambda kw: background_manager.start(kw["task"], run_background_task),
-    "get_background_task": lambda kw: background_manager.get(kw["task_id"]),
-    "list_background_tasks": lambda kw: background_manager.list(),
-    "create_team_agent": lambda kw: team_manager.create_agent(
+    "start_background_task": main_scope_only(lambda kw: background_manager.start(kw["task"], run_background_task)),
+    "get_background_task": main_scope_only(lambda kw: background_manager.get(kw["task_id"])),
+    "list_background_tasks": main_scope_only(lambda kw: background_manager.list()),
+    "create_team_agent": main_scope_only(lambda kw: team_manager.create_agent(
         kw["name"],
         kw["role"],
         kw.get("system_prompt"),
-    ),
-    "list_team_agents": lambda kw: team_manager.list_agents(),
-    "assign_team_task": lambda kw: team_manager.assign_task(
+        kw.get("worktree_id"),
+    )),
+    "list_team_agents": main_scope_only(lambda kw: team_manager.list_agents()),
+    "assign_team_task": main_scope_only(lambda kw: team_manager.assign_task(
         kw["agent_id"],
         kw["task"],
         run_team_agent_task,
-    ),
-    "get_team_task": lambda kw: team_manager.get_task(kw["task_id"]),
-    "list_team_tasks": lambda kw: team_manager.list_tasks(),
-    "cancel_team_task": lambda kw: team_manager.cancel_task(kw["task_id"]),
-    "review_team_task": lambda kw: team_manager.review_task(
+        kw.get("worktree_id"),
+    )),
+    "get_team_task": main_scope_only(lambda kw: team_manager.get_task(kw["task_id"])),
+    "list_team_tasks": main_scope_only(lambda kw: team_manager.list_tasks()),
+    "cancel_team_task": main_scope_only(lambda kw: team_manager.cancel_task(kw["task_id"])),
+    "review_team_task": main_scope_only(lambda kw: team_manager.review_task(
         kw["task_id"],
         kw["decision"],
         kw.get("feedback"),
-    ),
-    "stop_team_agent": lambda kw: team_manager.stop_agent(kw["agent_id"]),
+    )),
+    "stop_team_agent": main_scope_only(lambda kw: team_manager.stop_agent(kw["agent_id"])),
+    "create_worktree": main_scope_only(lambda kw: worktree_manager.create(
+        kw["name"],
+        kw.get("branch"),
+        kw.get("base_ref"),
+        kw.get("create_branch", True),
+    )),
+    "list_worktrees": main_scope_only(lambda kw: worktree_manager.list()),
+    "get_worktree": main_scope_only(lambda kw: worktree_manager.get(kw["worktree_id"])),
+    "remove_worktree": main_scope_only(lambda kw: worktree_manager.remove(
+        kw["worktree_id"],
+        kw.get("force", False),
+    )),
 }
 
 
