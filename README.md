@@ -33,6 +33,7 @@ cp .env.example .env
 - 支持读取工作区文件、执行受限检查命令、压缩上下文
 - 支持通过 USTB 认证流程获取并缓存课表
 - 支持启动 background 子 agent 执行独立任务，并通过任务 id 查询结果
+- 支持 agent team：创建角色化子 agent、分配任务、查询/审核结果、停止子 agent 生命周期
 
 首次获取课表时会生成 `network_block/Auth/ustb_qrcode.png`，需要用微信扫码确认。认证后的 Cookie 会缓存到 `network_block/Auth/cookie.json`。这两个文件都已加入 `.gitignore`。
 
@@ -45,6 +46,21 @@ cp .env.example .env
 - `list_background_tasks`：列出当前进程内的后台任务
 
 后台任务在独立线程里运行，使用独立上下文，不会阻塞主输入循环。当前任务状态只保存在当前进程内，重启程序后会清空。
+
+## Agent Team
+
+主 agent 可以通过 team 工具管理多个角色化子 agent：
+
+- `create_team_agent`：创建子 agent，指定 `name`、`role` 和可选 `system_prompt`
+- `list_team_agents`：查看所有子 agent 及生命周期状态
+- `assign_team_task`：把任务派给指定子 agent，并在后台执行
+- `list_team_tasks`：查看所有 team 任务、负责人、执行状态和审核状态
+- `get_team_task`：查看单个任务的结果、错误、审核信息
+- `review_team_task`：对已完成任务执行 `approved` 或 `rejected` 审核
+- `cancel_team_task`：请求取消未完成任务
+- `stop_team_agent`：停止子 agent，让它不再接受新任务
+
+team 任务同样在当前进程的后台线程里运行。停止子 agent 会阻止新任务进入；已运行中的模型调用会自然结束，不会被强制中断。
 
 ## 安全说明
 
@@ -70,3 +86,4 @@ cp .env.example .env
     - [ ] 工具发送消息与小程序对接，实际编写
 - [ ] 添加background、agent team功能
   - [x] 添加background子agent执行任务功能
+  - [x] 添加agent team 功能实现子agent创建，任务管理、审核，子进程生命周期管理
