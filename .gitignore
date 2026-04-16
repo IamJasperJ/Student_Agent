@@ -1,6 +1,6 @@
 .*
 !.gitignore
-!.env_sample
+!.env.example
 test*
 Problem/
 network_block/Auth/cookie.json
