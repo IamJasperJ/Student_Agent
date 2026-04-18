@@ -43,6 +43,7 @@ def current_tool_scope():
 BASE_TOOLS = [
     Tools.RUNBASH_DESCRIPTION,
     Tools.RUNREAD_DESCRIPTION,
+    Tools.RUNEDIT_DESCRIPTION,
     Tools.CONTEXTCOMPRESSION_DESCRIPTION,
     Tools.GETSCHE_DESCRIPTION,
 ]
@@ -1041,6 +1042,12 @@ def main_scope_only(handler):
 TOOLS_HANDLE = {
     "bash": lambda kw: Tools.run_bash(kw['command'], current_workdir()),
     "read_file": lambda kw: Tools.run_read(kw['path'], kw.get('limit'), current_workdir()),
+    "edit_file_block": lambda kw: Tools.run_edit_block(
+        kw['path'],
+        kw['old_str'],
+        kw['new_str'],
+        current_workdir(),
+    ),
     # "write_file": lambda kw: Tools.run_write(kw['path'], kw.get('limit'), WORKDIR),
     "contextCompression": lambda kw: Tools.contextCompression(kw['messages'], kw.get('threshold'), kw.get('summary_focus')),
     "get_class_sche": lambda kw: Tools.get_class_sche(kw.get("update_force", False)),
