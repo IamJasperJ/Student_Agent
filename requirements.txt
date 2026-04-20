@@ -9,5 +9,7 @@ pydantic==2.12.5
 python-dotenv==1.2.1
 # 工具类
 tqdm==4.67.3
-# MCP SDK (Model Context Protocol)
+# MCP SDK (Model Context Protocol) — mcpsdk 依赖官方 mcp 客户端
 mcpsdk>=0.1.0
+mcp>=1.27.0
+authlib==1.7.0
