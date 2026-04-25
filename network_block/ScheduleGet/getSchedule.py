@@ -77,12 +77,24 @@ def getSchedule(update_force: bool = False):
         info = response.json()
         if not isinstance(info, list):
             return {"ok": False, "error": "课表接口返回格式不是列表", "raw": info}
-
         parse_sche = []
+        def get_week_day(key):
+            # 匹配 xq 后面的数字
+            match = re.search(r"xq(\d+)", key)
+            if match:
+                num = match.group(1)
+                week_dict = {
+                    "1": "星期一", "2": "星期二", "3": "星期三", 
+                    "4": "星期四", "5": "星期五", "6": "星期六", "7": "星期日"
+                }
+                return week_dict.get(num, "未知星期")
+            return None
         for dic in info:
             raw_course = dic.get("SKSJ") if isinstance(dic, dict) else None
             if raw_course:
                 parse_sche.append(parse_course_info(raw_course))
+            if dic.get("KEY"):
+                parse_sche[-1]["星期"] = get_week_day(dic["KEY"])
         writeSchedule(parse_sche)
         return parse_sche
     except requests.exceptions.HTTPError as err:
@@ -161,4 +173,4 @@ def writeSchedule(parse_sche):
 
 
 if __name__ == "__main__":
-    getSchedule()
+    getSchedule(True)
